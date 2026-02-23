@@ -153,6 +153,20 @@ def plot_molecule(ax, positions, atom_type, alpha, spheres_3d, hex_bg_color,
                         c=hex_bg_color, alpha=alpha)
 
 
+def _set_axis_line_color(ax, color):
+    """Set 3D axis line color. Compatible with old (w_xaxis) and new (xaxis) matplotlib Axes3D API."""
+    try:
+        if hasattr(ax, 'w_xaxis') and hasattr(ax.w_xaxis, 'line'):
+            ax.w_xaxis.line.set_color(color)
+        else:
+            for name in ('xaxis', 'yaxis', 'zaxis'):
+                axis = getattr(ax, name, None)
+                if axis is not None and hasattr(axis, 'line'):
+                    axis.line.set_color(color)
+    except (AttributeError, TypeError):
+        pass  # skip if this matplotlib version uses a different 3D axis API
+
+
 def plot_data3d(positions, atom_type, dataset_info, camera_elev=0, camera_azim=0, save_path=None, spheres_3d=False,
                 bg='black', alpha=1.):
     black = (0, 0, 0)
@@ -174,10 +188,7 @@ def plot_data3d(positions, atom_type, dataset_info, camera_elev=0, camera_azim=0
     ax.zaxis.pane.set_alpha(0)
     ax._axis3don = False
 
-    if bg == 'black':
-        ax.w_xaxis.line.set_color("black")
-    else:
-        ax.w_xaxis.line.set_color("white")
+    _set_axis_line_color(ax, "black" if bg == 'black' else "white")
 
     plot_molecule(ax, positions, atom_type, alpha, spheres_3d,
                   hex_bg_color, dataset_info)
@@ -237,10 +248,7 @@ def plot_data3d_uncertainty(
     ax.zaxis.pane.set_alpha(0)
     ax._axis3don = False
 
-    if bg == 'black':
-        ax.w_xaxis.line.set_color("black")
-    else:
-        ax.w_xaxis.line.set_color("white")
+    _set_axis_line_color(ax, "black" if bg == 'black' else "white")
 
     for i in range(len(all_positions)):
         positions = all_positions[i]

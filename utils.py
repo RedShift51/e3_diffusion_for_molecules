@@ -1,7 +1,23 @@
+import logging
 import numpy as np
 import getpass
 import os
 import torch
+
+
+def setup_logging(level=logging.INFO, format_str='%(asctime)s %(levelname)s %(name)s: %(message)s'):
+    """Configure root logger. Call once from main script."""
+    logging.basicConfig(level=level, format=format_str, datefmt='%Y-%m-%d %H:%M:%S', force=True)
+
+
+def add_log_file(log_file_path, format_str='%(asctime)s %(levelname)s %(name)s: %(message)s'):
+    """Add a FileHandler to the root logger so all logs are also written to the file."""
+    root = logging.getLogger()
+    fh = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+    fh.setFormatter(logging.Formatter(format_str, datefmt='%Y-%m-%d %H:%M:%S'))
+    root.addHandler(fh)
+    return fh
+
 
 # Folders
 def create_folders(args):
@@ -55,15 +71,13 @@ def gradient_clipping(flow, gradnorm_queue):
     grad_norm = torch.nn.utils.clip_grad_norm_(
         flow.parameters(), max_norm=max_grad_norm, norm_type=2.0)
 
-    if float(grad_norm) > max_grad_norm:
+    was_clipped = float(grad_norm) > max_grad_norm
+    if was_clipped:
         gradnorm_queue.add(float(max_grad_norm))
     else:
         gradnorm_queue.add(float(grad_norm))
-
-    if float(grad_norm) > max_grad_norm:
-        print(f'Clipped gradient with value {grad_norm:.1f} '
-              f'while allowed {max_grad_norm:.1f}')
-    return grad_norm
+    # Per-batch clip log disabled; train_test logs a short summary per epoch.
+    return float(grad_norm), was_clipped
 
 
 # Rotation data augmntation

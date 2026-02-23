@@ -1,0 +1,47 @@
+# EDM QM9 training setup (README-recommended)
+# Run: python main_qm9.py --config configs/edm_qm9.yaml
+# Or:  python main_qm9.py --preset edm_qm9
+#
+# Output dir: outputs/<exp_name> (e.g. outputs/edm_qm9), relative to cwd.
+#
+# LoRA: lora_rank 0 = full model fine-tune. lora_rank > 0 = LoRA fine-tune;
+#       then pretrained_model_path is required (dir with generative_model.npy or path to .npy).
+
+exp_name: edm_qm9
+n_epochs: 2000
+n_stability_samples: 300  # stability analysis: 300 samples in batches of 100
+diffusion_noise_schedule: polynomial_2
+diffusion_noise_precision: 1e-5
+diffusion_steps: 1000
+# DDIM for sampling (stability/eval): 50 steps instead of 1000
+use_ddim: true
+sampling_steps: 50
+diffusion_loss_type: l2
+batch_size: 128
+num_workers: 16
+prefetch_factor: 4
+nf: 256
+n_layers: 9
+lr: 0.0001
+normalize_factors: [1, 4, 10]
+test_epochs: 20
+log_metrics_every: 100  # log batch metrics to file every N batches (tqdm still updates every batch)
+ema_decay: 0.999
+ema_start_epoch: 5  # start EMA updates after first epoch (0-based: 1 = second epoch)
+use_amp: true
+# amp_dtype: fp16 (default) | bfloat16 — bfloat16 often more stable, fewer inf/nan
+amp_dtype: bfloat16
+use_checkpointing: true
+save_model: true
+# Optimizer: adamw (default) | adam8bit (requires bitsandbytes, lower memory)
+optimizer: adamw
+
+# QM9: use_pyg_qm9=true uses torch_geometric.datasets.QM9 (recommended)
+use_pyg_qm9: true
+qm9_root: ./data/qm9
+qm9_train_size: 100000
+
+# LoRA: 0 = fine-tune full model; >0 = LoRA (then set pretrained_model_path)
+lora_rank: 0
+lora_alpha: null
+pretrained_model_path: null

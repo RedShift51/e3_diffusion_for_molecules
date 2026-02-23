@@ -34,7 +34,7 @@ def check_mask_correct(variables, node_mask):
 
 def analyze_and_save(args, eval_args, device, generative_model,
                      nodes_dist, prop_dist, dataset_info, n_samples=10,
-                     batch_size=10, save_to_xyz=False):
+                     batch_size=10, save_to_xyz=False, dataset_smiles_list=None):
     batch_size = min(batch_size, n_samples)
     assert n_samples % batch_size == 0
     molecules = {'one_hot': [], 'x': [], 'node_mask': []}
@@ -62,7 +62,7 @@ def analyze_and_save(args, eval_args, device, generative_model,
 
     molecules = {key: torch.cat(molecules[key], dim=0) for key in molecules}
     stability_dict, rdkit_metrics = analyze_stability_for_molecules(
-        molecules, dataset_info)
+        molecules, dataset_info, dataset_smiles_list=dataset_smiles_list)
 
     return stability_dict, rdkit_metrics
 
@@ -140,10 +140,19 @@ def main():
     utils.create_folders(args)
     print(args)
 
-    # Retrieve QM9 dataloaders
+    # Retrieve QM9 dataloaders (once)
     dataloaders, charge_scale = dataset.retrieve_dataloaders(args)
 
     dataset_info = get_dataset_info(args.dataset, args.remove_h)
+
+    # Train SMILES for novelty metric (use existing loader; no second QM9 load)
+    train_smiles_for_metrics = None
+    if 'qm9' in args.dataset:
+        try:
+            from qm9.rdkit_functions import get_train_smiles_for_metrics
+            train_smiles_for_metrics = get_train_smiles_for_metrics(dataloaders['train'], dataset_info)
+        except Exception as e:
+            print('Could not precompute train SMILES for metrics:', e)
 
     # Load model
     generative_model, nodes_dist, prop_dist = get_model(args, device, dataset_info, dataloaders['train'])
@@ -160,7 +169,8 @@ def main():
     stability_dict, rdkit_metrics = analyze_and_save(
         args, eval_args, device, generative_model, nodes_dist,
         prop_dist, dataset_info, n_samples=eval_args.n_samples,
-        batch_size=eval_args.batch_size_gen, save_to_xyz=eval_args.save_to_xyz)
+        batch_size=eval_args.batch_size_gen, save_to_xyz=eval_args.save_to_xyz,
+        dataset_smiles_list=train_smiles_for_metrics)
     print(stability_dict)
 
     if rdkit_metrics is not None:

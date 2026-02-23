@@ -6,6 +6,16 @@ import torch
 from configs.datasets_config import get_dataset_info
 import pickle
 import os
+import logging
+
+log = logging.getLogger(__name__)
+
+# Suppress RDKit per-molecule warnings (valence etc.); we log a summary instead
+try:
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')
+except Exception:
+    pass
 
 
 def compute_qm9_smiles(dataset_name, remove_h):
@@ -14,7 +24,7 @@ def compute_qm9_smiles(dataset_name, remove_h):
     :param dataset_name: qm9 or qm9_second_half
     :return:
     '''
-    print("\tConverting QM9 dataset to SMILES ...")
+    log.info('Converting QM9 dataset to SMILES...')
 
     class StaticArgs:
         def __init__(self, dataset, remove_h):
@@ -39,32 +49,74 @@ def compute_qm9_smiles(dataset_name, remove_h):
         mol = mol2smiles(mol)
         if mol is not None:
             mols_smiles.append(mol)
-        if i % 1000 == 0:
-            print("\tConverting QM9 dataset to SMILES {0:.2%}".format(float(i)/len(dataloaders['train'])))
+    n_total = len(dataloaders['train'])
+    n_ok = len(mols_smiles)
+    log.info('QM9 SMILES: %d/%d converted (sanitize failed: %d)', n_ok, n_total, n_total - n_ok)
+    return mols_smiles
+
+
+def _train_smiles_pickle_path(dataset_info):
+    dataset_name = dataset_info['name']
+    pickle_name = dataset_name if dataset_info['with_h'] else dataset_name + '_noH'
+    return 'qm9/temp/%s_smiles.pickle' % pickle_name
+
+
+def get_train_smiles_for_metrics(train_loader, dataset_info):
+    """
+    Build or load training SMILES list for novelty metric. Uses the given train_loader
+    (no second dataloader/QM9 load). Caches to pickle for next runs.
+    """
+    file_name = _train_smiles_pickle_path(dataset_info)
+    try:
+        with open(file_name, 'rb') as f:
+            qm9_smiles = pickle.load(f)
+        log.info('Loaded train SMILES from cache (%d molecules)', len(qm9_smiles))
+        return qm9_smiles
+    except OSError:
+        pass
+    n_types = 5 if dataset_info.get('with_h', True) else 4
+    log.info('Converting train set to SMILES (one-time, using existing dataloader)...')
+    mols_smiles = []
+    n_batches = len(train_loader)
+    for i, data in enumerate(train_loader):
+        positions = data['positions'][0].view(-1, 3).numpy()
+        one_hot = data['one_hot'][0].view(-1, n_types).type(torch.float32)
+        atom_type = torch.argmax(one_hot, dim=1).numpy()
+        mol = build_molecule(torch.tensor(positions), torch.tensor(atom_type), dataset_info)
+        mol = mol2smiles(mol)
+        if mol is not None:
+            mols_smiles.append(mol)
+        if (i + 1) % 500 == 0 or (i + 1) == n_batches:
+            log.info('Train SMILES %d/%d batches', i + 1, n_batches)
+    try:
+        os.makedirs('qm9/temp', exist_ok=True)
+        with open(file_name, 'wb') as f:
+            pickle.dump(mols_smiles, f)
+    except OSError:
+        pass
+    log.info('Train SMILES: %d/%d batches converted (cached)', len(mols_smiles), n_batches)
     return mols_smiles
 
 
 def retrieve_qm9_smiles(dataset_info):
-    dataset_name = dataset_info['name']
-    if dataset_info['with_h']:
-        pickle_name = dataset_name
-    else:
-        pickle_name = dataset_name + '_noH'
-
-    file_name = 'qm9/temp/%s_smiles.pickle' % pickle_name
+    """Fallback: load or compute train SMILES by creating a dataloader (avoid if you have one)."""
+    file_name = _train_smiles_pickle_path(dataset_info)
     try:
         with open(file_name, 'rb') as f:
-            qm9_smiles = pickle.load(f)
-        return qm9_smiles
+            return pickle.load(f)
     except OSError:
-        try:
-            os.makedirs('qm9/temp')
-        except:
-            pass
-        qm9_smiles = compute_qm9_smiles(dataset_name, remove_h=not dataset_info['with_h'])
+        pass
+    try:
+        os.makedirs('qm9/temp', exist_ok=True)
+    except OSError:
+        pass
+    qm9_smiles = compute_qm9_smiles(dataset_info['name'], remove_h=not dataset_info['with_h'])
+    try:
         with open(file_name, 'wb') as f:
             pickle.dump(qm9_smiles, f)
-        return qm9_smiles
+    except OSError:
+        pass
+    return qm9_smiles
 
 
 #### New implementation ####
@@ -85,9 +137,8 @@ class BasicMolecularMetrics(object):
                 self.dataset_info)
 
     def compute_validity(self, generated):
-        """ generated: list of couples (positions, atom_types)"""
+        """ generated: list of couples (positions, atom_types). Returns (valid_smiles_list, validity_ratio). """
         valid = []
-
         for graph in generated:
             mol = build_molecule(*graph, self.dataset_info)
             smiles = mol2smiles(mol)
@@ -96,7 +147,9 @@ class BasicMolecularMetrics(object):
                 largest_mol = max(mol_frags, default=mol, key=lambda m: m.GetNumAtoms())
                 smiles = mol2smiles(largest_mol)
                 valid.append(smiles)
-
+        n_fail = len(generated) - len(valid)
+        if n_fail > 0:
+            log.info('RDKit sanitize failed: %d/%d (valence/invalid)', n_fail, len(generated))
         return valid, len(valid) / len(generated)
 
     def compute_uniqueness(self, valid):
@@ -116,14 +169,13 @@ class BasicMolecularMetrics(object):
         """ generated: list of pairs (positions: n x 3, atom_types: n [int])
             the positions and atom types should already be masked. """
         valid, validity = self.compute_validity(generated)
-        print(f"Validity over {len(generated)} molecules: {validity * 100 :.2f}%")
+        log.info('metrics validity=%.4f (valid=%d/%d)', validity, len(valid), len(generated))
         if validity > 0:
             unique, uniqueness = self.compute_uniqueness(valid)
-            print(f"Uniqueness over {len(valid)} valid molecules: {uniqueness * 100 :.2f}%")
-
+            log.info('metrics uniqueness=%.4f (unique=%d/%d)', uniqueness, len(set(valid)), len(valid))
             if self.dataset_smiles_list is not None:
                 _, novelty = self.compute_novelty(unique)
-                print(f"Novelty over {len(unique)} unique valid molecules: {novelty * 100 :.2f}%")
+                log.info('metrics novelty=%.4f', novelty)
             else:
                 novelty = 0.0
         else:

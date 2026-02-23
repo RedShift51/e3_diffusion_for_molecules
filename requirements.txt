@@ -1,7 +1,12 @@
 imageio
 numpy
+pyyaml
 scipy
-torch
-torchvision
+torch==2.6.0
+torchvision==0.21.0
+bitsandbytes
 tqdm
 wandb
+peft
+torch-geometric
+rdkit

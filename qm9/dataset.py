@@ -7,12 +7,15 @@ import os
 
 def retrieve_dataloaders(cfg):
     if 'qm9' in cfg.dataset:
+        # Use PyTorch Geometric QM9 (recommended: no manual download)
+        if getattr(cfg, 'use_pyg_qm9', True):
+            from qm9.data.qm9_pyg import retrieve_dataloaders_pyg_qm9
+            return retrieve_dataloaders_pyg_qm9(cfg)
+        # Legacy: figshare download + npz
         batch_size = cfg.batch_size
         num_workers = cfg.num_workers
         filter_n_atoms = cfg.filter_n_atoms
-        # Initialize dataloader
         args = init_argparse('qm9')
-        # data_dir = cfg.data_root_dir
         args, datasets, num_species, charge_scale = initialize_datasets(args, cfg.datadir, cfg.dataset,
                                                                         subtract_thermo=args.subtract_thermo,
                                                                         force_download=args.force_download,
@@ -27,14 +30,19 @@ def retrieve_dataloaders(cfg):
             print("Retrieving molecules with only %d atoms" % filter_n_atoms)
             datasets = filter_atoms(datasets, filter_n_atoms)
 
-        # Construct PyTorch dataloaders from datasets
         preprocess = PreprocessQM9(load_charges=cfg.include_charges)
-        dataloaders = {split: DataLoader(dataset,
-                                         batch_size=batch_size,
-                                         shuffle=args.shuffle if (split == 'train') else False,
-                                         num_workers=num_workers,
-                                         collate_fn=preprocess.collate_fn)
-                             for split, dataset in datasets.items()}
+        prefetch_factor = getattr(cfg, 'prefetch_factor', 2)
+        dataloaders = {}
+        for split, dataset in datasets.items():
+            dl_kw = dict(
+                batch_size=batch_size,
+                shuffle=args.shuffle if (split == 'train') else False,
+                num_workers=num_workers,
+                collate_fn=preprocess.collate_fn,
+            )
+            if num_workers > 0:
+                dl_kw['prefetch_factor'] = prefetch_factor
+            dataloaders[split] = DataLoader(dataset, **dl_kw)
     elif 'geom' in cfg.dataset:
         import build_geom_dataset
         from configs.datasets_config import get_dataset_info

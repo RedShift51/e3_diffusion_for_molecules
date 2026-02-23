@@ -320,7 +320,7 @@ def main_check_stability(remove_h: bool, batch_size=32):
         test_validity_for(test_loader)
 
 
-def analyze_stability_for_molecules(molecule_list, dataset_info):
+def analyze_stability_for_molecules(molecule_list, dataset_info, dataset_smiles_list=None):
     one_hot = molecule_list['one_hot']
     x = molecule_list['x']
     node_mask = molecule_list['node_mask']
@@ -363,7 +363,7 @@ def analyze_stability_for_molecules(molecule_list, dataset_info):
     }
 
     if use_rdkit:
-        metrics = BasicMolecularMetrics(dataset_info)
+        metrics = BasicMolecularMetrics(dataset_info, dataset_smiles_list=dataset_smiles_list)
         rdkit_metrics = metrics.evaluate(processed_list)
         #print("Unique molecules:", rdkit_metrics[1])
         return validity_dict, rdkit_metrics

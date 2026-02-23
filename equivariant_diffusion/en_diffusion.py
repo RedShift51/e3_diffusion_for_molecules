@@ -39,6 +39,8 @@ def polynomial_schedule(timesteps: int, s=1e-4, power=3.):
     """
     A noise schedule based on a simple polynomial equation: 1 - x^power.
     """
+    s = float(s)
+    power = float(power)
     steps = timesteps + 1
     x = np.linspace(0, steps, steps)
     alphas2 = (1 - np.power(x / steps, power))**2
@@ -174,6 +176,7 @@ class PredefinedNoiseSchedule(torch.nn.Module):
     def __init__(self, noise_schedule, timesteps, precision):
         super(PredefinedNoiseSchedule, self).__init__()
         self.timesteps = timesteps
+        precision = float(precision)
 
         if noise_schedule == 'cosine':
             alphas2 = cosine_beta_schedule(timesteps)
@@ -258,12 +261,15 @@ class EnVariationalDiffusion(torch.nn.Module):
             dynamics: models.EGNN_dynamics_QM9, in_node_nf: int, n_dims: int,
             timesteps: int = 1000, parametrization='eps', noise_schedule='learned',
             noise_precision=1e-4, loss_type='vlb', norm_values=(1., 1., 1.),
-            norm_biases=(None, 0., 0.), include_charges=True):
+            norm_biases=(None, 0., 0.), include_charges=True,
+            use_ddim=False, sampling_steps=None):
         super().__init__()
 
         assert loss_type in {'vlb', 'l2'}
         self.loss_type = loss_type
         self.include_charges = include_charges
+        self.use_ddim = use_ddim
+        self.sampling_steps = sampling_steps  # None = use all timesteps
         if noise_schedule == 'learned':
             assert loss_type == 'vlb', 'A noise schedule can only be learned' \
                                        ' with a vlb objective.'
@@ -472,17 +478,18 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         return degrees_of_freedom_x * (- log_sigma_x - 0.5 * np.log(2 * np.pi))
 
-    def sample_p_xh_given_z0(self, z0, node_mask, edge_mask, context, fix_noise=False):
-        """Samples x ~ p(x|z0)."""
+    def sample_p_xh_given_z0(self, z0, node_mask, edge_mask, context, fix_noise=False, use_ddim=False):
+        """Samples x ~ p(x|z0). use_ddim=True: return mean (deterministic)."""
         zeros = torch.zeros(size=(z0.size(0), 1), device=z0.device)
         gamma_0 = self.gamma(zeros)
-        # Computes sqrt(sigma_0^2 / alpha_0^2)
         sigma_x = self.SNR(-0.5 * gamma_0).unsqueeze(1)
         net_out = self.phi(z0, zeros, node_mask, edge_mask, context)
 
-        # Compute mu for p(zs | zt).
         mu_x = self.compute_x_pred(net_out, z0, gamma_0)
-        xh = self.sample_normal(mu=mu_x, sigma=sigma_x, node_mask=node_mask, fix_noise=fix_noise)
+        if use_ddim:
+            xh = mu_x
+        else:
+            xh = self.sample_normal(mu=mu_x, sigma=sigma_x, node_mask=node_mask, fix_noise=fix_noise)
 
         x = xh[:, :, :self.n_dims]
 
@@ -711,8 +718,8 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         return neg_log_pxh
 
-    def sample_p_zs_given_zt(self, s, t, zt, node_mask, edge_mask, context, fix_noise=False):
-        """Samples from zs ~ p(zs | zt). Only used during sampling."""
+    def sample_p_zs_given_zt(self, s, t, zt, node_mask, edge_mask, context, fix_noise=False, use_ddim=False):
+        """Samples from zs ~ p(zs | zt). use_ddim=True: deterministic step zs = mu (no noise)."""
         gamma_s = self.gamma(s)
         gamma_t = self.gamma(t)
 
@@ -730,11 +737,12 @@ class EnVariationalDiffusion(torch.nn.Module):
         diffusion_utils.assert_mean_zero_with_mask(eps_t[:, :, :self.n_dims], node_mask)
         mu = zt / alpha_t_given_s - (sigma2_t_given_s / alpha_t_given_s / sigma_t) * eps_t
 
-        # Compute sigma for p(zs | zt).
-        sigma = sigma_t_given_s * sigma_s / sigma_t
-
-        # Sample zs given the paramters derived from zt.
-        zs = self.sample_normal(mu, sigma, node_mask, fix_noise)
+        # DDIM: deterministic; else stochastic.
+        if use_ddim:
+            zs = mu
+        else:
+            sigma = sigma_t_given_s * sigma_s / sigma_t
+            zs = self.sample_normal(mu, sigma, node_mask, fix_noise)
 
         # Project down to avoid numerical runaway of the center of gravity.
         zs = torch.cat(
@@ -761,26 +769,35 @@ class EnVariationalDiffusion(torch.nn.Module):
     def sample(self, n_samples, n_nodes, node_mask, edge_mask, context, fix_noise=False):
         """
         Draw samples from the generative model.
+        When use_ddim and sampling_steps are set, uses DDIM with fewer steps.
         """
         if fix_noise:
-            # Noise is broadcasted over the batch axis, useful for visualizations.
             z = self.sample_combined_position_feature_noise(1, n_nodes, node_mask)
         else:
             z = self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
 
         diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
 
-        # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
-        for s in reversed(range(0, self.T)):
-            s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
-            t_array = s_array + 1
-            s_array = s_array / self.T
-            t_array = t_array / self.T
+        use_ddim = self.use_ddim and (self.sampling_steps is not None and self.sampling_steps > 0)
+        if use_ddim and self.sampling_steps < self.T:
+            # DDIM: subsequence of steps [0, step, 2*step, ..., T]
+            step_indices = torch.linspace(0, self.T, self.sampling_steps + 1, device=z.device)
+            for i in range(len(step_indices) - 1, 0, -1):
+                t_int = step_indices[i].long().item()
+                s_int = step_indices[i - 1].long().item()
+                t_array = torch.full((n_samples, 1), fill_value=t_int / self.T, device=z.device)
+                s_array = torch.full((n_samples, 1), fill_value=s_int / self.T, device=z.device)
+                z = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context,
+                                              fix_noise=fix_noise, use_ddim=True)
+        else:
+            for s in reversed(range(0, self.T)):
+                s_array = torch.full((n_samples, 1), fill_value=s / self.T, device=z.device)
+                t_array = torch.full((n_samples, 1), fill_value=(s + 1) / self.T, device=z.device)
+                z = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context,
+                                              fix_noise=fix_noise, use_ddim=False)
 
-            z = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context, fix_noise=fix_noise)
-
-        # Finally sample p(x, h | z_0).
-        x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise)
+        x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context,
+                                          fix_noise=fix_noise, use_ddim=use_ddim)
 
         diffusion_utils.assert_mean_zero_with_mask(x, node_mask)
 

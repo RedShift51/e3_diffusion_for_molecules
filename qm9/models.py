@@ -1,3 +1,4 @@
+import logging
 import torch
 from torch.distributions.categorical import Categorical
 
@@ -5,6 +6,8 @@ import numpy as np
 from egnn.models import EGNN_dynamics_QM9
 
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion
+
+log = logging.getLogger(__name__)
 
 
 def get_model(args, device, dataset_info, dataloader_train):
@@ -19,18 +22,22 @@ def get_model(args, device, dataset_info, dataloader_train):
     if args.condition_time:
         dynamics_in_node_nf = in_node_nf + 1
     else:
-        print('Warning: dynamics model is _not_ conditioned on time.')
+        log.warning('Dynamics model is not conditioned on time.')
         dynamics_in_node_nf = in_node_nf
 
+    use_checkpointing = getattr(args, 'use_checkpointing', False)
     net_dynamics = EGNN_dynamics_QM9(
         in_node_nf=dynamics_in_node_nf, context_node_nf=args.context_node_nf,
         n_dims=3, device=device, hidden_nf=args.nf,
         act_fn=torch.nn.SiLU(), n_layers=args.n_layers,
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method)
+        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
+        use_checkpointing=use_checkpointing)
 
     if args.probabilistic_model == 'diffusion':
+        use_ddim = getattr(args, 'use_ddim', False)
+        sampling_steps = getattr(args, 'sampling_steps', None)
         vdm = EnVariationalDiffusion(
             dynamics=net_dynamics,
             in_node_nf=in_node_nf,
@@ -40,7 +47,9 @@ def get_model(args, device, dataset_info, dataloader_train):
             noise_precision=args.diffusion_noise_precision,
             loss_type=args.diffusion_loss_type,
             norm_values=args.normalize_factors,
-            include_charges=args.include_charges
+            include_charges=args.include_charges,
+            use_ddim=use_ddim,
+            sampling_steps=sampling_steps,
             )
 
         return vdm, nodes_dist, prop_dist
@@ -50,10 +59,28 @@ def get_model(args, device, dataset_info, dataloader_train):
 
 
 def get_optim(args, generative_model):
-    optim = torch.optim.AdamW(
-        generative_model.parameters(),
-        lr=args.lr, amsgrad=True,
-        weight_decay=1e-12)
+    optimizer_name = getattr(args, 'optimizer', 'adamw').lower()
+    if optimizer_name == 'adam8bit':
+        try:
+            from bitsandbytes.optim import Adam8bit
+            optim = Adam8bit(
+                generative_model.parameters(),
+                lr=args.lr,
+                betas=(0.9, 0.999),
+                weight_decay=1e-12,
+            )
+            log.info('Using Adam8bit optimizer')
+        except ImportError:
+            log.warning('bitsandbytes not found, falling back to AdamW. Install with: pip install bitsandbytes')
+            optim = torch.optim.AdamW(
+                generative_model.parameters(),
+                lr=args.lr, amsgrad=True,
+                weight_decay=1e-12)
+    else:
+        optim = torch.optim.AdamW(
+            generative_model.parameters(),
+            lr=args.lr, amsgrad=True,
+            weight_decay=1e-12)
 
     return optim
 
@@ -75,7 +102,7 @@ class DistributionNodes:
         self.prob = torch.from_numpy(prob).float()
 
         entropy = torch.sum(self.prob * torch.log(self.prob + 1e-30))
-        print("Entropy of n_nodes: H[N]", entropy.item())
+        log.info("Entropy of n_nodes H[N]: %s", entropy.item())
 
         self.m = Categorical(torch.tensor(prob))
 
@@ -174,7 +201,7 @@ class DistributionProperty:
 
 if __name__ == '__main__':
     dist_nodes = DistributionNodes()
-    print(dist_nodes.n_nodes)
-    print(dist_nodes.prob)
+    log.info("n_nodes: %s", dist_nodes.n_nodes)
+    log.info("prob: %s", dist_nodes.prob)
     for i in range(10):
-        print(dist_nodes.sample())
+        log.info("sample: %s", dist_nodes.sample())

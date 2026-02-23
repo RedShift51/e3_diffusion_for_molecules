@@ -82,7 +82,15 @@ def gen_splits_gdb9(gdb9dir, cleanup=True):
     logging.info('Splits were not specified! Automatically generating.')
     gdb9_url_excluded = 'https://springernature.figshare.com/ndownloader/files/3195404'
     gdb9_txt_excluded = join(gdb9dir, 'uncharacterized.txt')
-    urllib.request.urlretrieve(gdb9_url_excluded, filename=gdb9_txt_excluded)
+
+    def _download_excluded():
+        if not os.path.exists(gdb9_txt_excluded):
+            logging.info('Downloading uncharacterized.txt (excluded molecules list).')
+            urllib.request.urlretrieve(gdb9_url_excluded, filename=gdb9_txt_excluded)
+        else:
+            logging.info('Using existing uncharacterized.txt')
+
+    _download_excluded()
 
     # First get list of excluded indices
     excluded_strings = []
@@ -92,6 +100,17 @@ def gen_splits_gdb9(gdb9dir, cleanup=True):
                             for line in lines if len(line.split()) > 0]
 
     excluded_idxs = [int(idx) - 1 for idx in excluded_strings if is_int(idx)]
+
+    # If file was empty or wrong (e.g. error page), re-download once
+    if len(excluded_idxs) != 3054:
+        logging.warning('uncharacterized.txt had %d entries (expected 3054). Re-downloading.', len(excluded_idxs))
+        if os.path.exists(gdb9_txt_excluded):
+            os.remove(gdb9_txt_excluded)
+        _download_excluded()
+        with open(gdb9_txt_excluded) as f:
+            lines = f.readlines()
+            excluded_strings = [line.split()[0] for line in lines if len(line.split()) > 0]
+        excluded_idxs = [int(idx) - 1 for idx in excluded_strings if is_int(idx)]
 
     assert len(excluded_idxs) == 3054, 'There should be exactly 3054 excluded atoms. Found {}'.format(
         len(excluded_idxs))

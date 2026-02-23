@@ -6,9 +6,12 @@ except ModuleNotFoundError:
 import build_geom_dataset
 from configs.datasets_config import geom_with_h
 import copy
+import logging
 import utils
+utils.setup_logging()
+log = logging.getLogger(__name__)
 import argparse
-import wandb
+# import wandb  # disabled: use log file only
 from os.path import join
 from qm9.models import get_optim, get_model
 from equivariant_diffusion import en_diffusion
@@ -19,6 +22,7 @@ import time
 import pickle
 
 from qm9.utils import prepare_context, compute_mean_mad
+from tqdm import tqdm
 import train_test
 
 
@@ -75,14 +79,16 @@ parser.add_argument('--filter_n_atoms', type=int, default=None,
 parser.add_argument('--dequantization', type=str, default='argmax_variational',
                     help='uniform | variational | argmax_variational | deterministic')
 parser.add_argument('--n_report_steps', type=int, default=50)
-parser.add_argument('--wandb_usr', type=str)
-parser.add_argument('--no_wandb', action='store_true', help='Disable wandb')
-parser.add_argument('--online', type=bool, default=True, help='True = wandb online -- False = wandb offline')
+# parser.add_argument('--wandb_usr', type=str)
+# parser.add_argument('--no_wandb', action='store_true', help='Disable wandb')
+# parser.add_argument('--online', type=bool, default=True, help='True = wandb online -- False = wandb offline')
 parser.add_argument('--no-cuda', action='store_true', default=False, help='disable CUDA training')
 parser.add_argument('--save_model', type=eval, default=True, help='save model')
 parser.add_argument('--generate_epochs', type=int, default=1)
 parser.add_argument('--num_workers', type=int, default=0,
-                    help='Number of worker for the dataloader')
+                    help='Number of workers for the dataloader')
+parser.add_argument('--prefetch_factor', type=int, default=2,
+                    help='Batches to prefetch per worker (when num_workers > 0)')
 parser.add_argument('--test_epochs', type=int, default=1)
 parser.add_argument('--data_augmentation', type=eval, default=False,
                     help='use attention in the EGNN')
@@ -113,7 +119,24 @@ parser.add_argument('--filter_molecule_size', type=int, default=None,
                     help="Only use molecules below this size.")
 parser.add_argument('--sequential', action='store_true',
                     help='Organize data by size to reduce average memory usage.')
+# LoRA, checkpointing, mixed precision
+parser.add_argument('--lora_rank', type=int, default=0,
+                    help='LoRA rank; 0 = full fine-tune, >0 = LoRA (requires --pretrained_model_path)')
+parser.add_argument('--lora_alpha', type=float, default=None,
+                    help='LoRA alpha (default: lora_rank)')
+parser.add_argument('--pretrained_model_path', type=str, default=None,
+                    help='Path to pretrained checkpoint (dir or .npy). Required when lora_rank > 0.')
+parser.add_argument('--use_checkpointing', type=eval, default=False,
+                    help='Use gradient checkpointing in EGNN blocks to save memory')
+parser.add_argument('--use_amp', type=eval, default=False,
+                    help='Use automatic mixed precision (AMP) for training')
+parser.add_argument('--optimizer', type=str, default='adamw',
+                    help='Optimizer: adamw | adam8bit (requires bitsandbytes)')
 args = parser.parse_args()
+
+if args.resume is None:
+    from datetime import datetime
+    args.exp_name = args.exp_name + '_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
 data_file = './data/geom/geom_drugs_30.npy'
 
@@ -143,13 +166,13 @@ atom_encoder = dataset_info['atom_encoder']
 atom_decoder = dataset_info['atom_decoder']
 
 # args, unparsed_args = parser.parse_known_args()
-args.wandb_usr = utils.get_wandb_username(args.wandb_usr)
+# args.wandb_usr = utils.get_wandb_username(args.wandb_usr)
 
 if args.resume is not None:
     exp_name = args.exp_name + '_resume'
     start_epoch = args.start_epoch
     resume = args.resume
-    wandb_usr = args.wandb_usr
+    # wandb_usr = getattr(args, 'wandb_usr', None)
 
     with open(join(args.resume, 'args.pickle'), 'rb') as f:
         args = pickle.load(f)
@@ -157,27 +180,35 @@ if args.resume is not None:
     args.break_train_epoch = False
     args.exp_name = exp_name
     args.start_epoch = start_epoch
-    args.wandb_usr = wandb_usr
-    print(args)
+    # args.wandb_usr = wandb_usr
+    log.info('Args: %s', args)
 
 utils.create_folders(args)
-print(args)
+log.info('Args: %s', args)
 
-# Wandb config
-if args.no_wandb:
-    mode = 'disabled'
-else:
-    mode = 'online' if args.online else 'offline'
-kwargs = {'entity': args.wandb_usr, 'name': args.exp_name, 'project': 'e3_diffusion_geom', 'config': args,
-          'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': mode}
-wandb.init(**kwargs)
-wandb.save('*.txt')
+# All logs to file
+log_dir = join('outputs', args.exp_name)
+log_file = join(log_dir, 'train.log')
+utils.add_log_file(log_file)
+log.info('Logging to %s', log_file)
+log.info('Config: %s', getattr(args, 'config', None))
+log.info('Args: %s', args)
+
+# Wandb disabled (uncomment to enable)
+# if args.no_wandb:
+#     mode = 'disabled'
+# else:
+#     mode = 'online' if args.online else 'offline'
+# kwargs = {'entity': args.wandb_usr, 'name': args.exp_name, 'project': 'e3_diffusion_geom', 'config': args,
+#           'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': mode}
+# wandb.init(**kwargs)
+# wandb.save('*.txt')
 
 data_dummy = next(iter(dataloaders['train']))
 
 
 if len(args.conditioning) > 0:
-    print(f'Conditioning on {args.conditioning}')
+    log.info('Conditioning on %s', args.conditioning)
     property_norms = compute_mean_mad(dataloaders, args.conditioning)
     context_dummy = prepare_context(args.conditioning, data_dummy, property_norms)
     context_node_nf = context_dummy.size(2)
@@ -190,6 +221,25 @@ args.context_node_nf = context_node_nf
 
 # Create EGNN flow
 model, nodes_dist, prop_dist = get_model(args, device, dataset_info, dataloader_train=dataloaders['train'])
+lora_rank = getattr(args, 'lora_rank', 0)
+pretrained_path = getattr(args, 'pretrained_model_path', None)
+if lora_rank > 0:
+    if not pretrained_path:
+        raise ValueError('When lora_rank > 0, --pretrained_model_path is required (path to dir or generative_model.npy)')
+    import os
+    from egnn.lora import inject_lora, freeze_base_lora
+    path = pretrained_path
+    if os.path.isdir(path):
+        fn = 'generative_model_ema.npy' if getattr(args, 'ema_decay', 0) > 0 else 'generative_model.npy'
+        path = join(path, fn)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'Pretrained checkpoint not found: {path}')
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt, strict=True)
+    log.info('Loaded pretrained from %s', path)
+    n_lora = inject_lora(model, rank=lora_rank, alpha=getattr(args, 'lora_alpha', None) or lora_rank)
+    freeze_base_lora(model)
+    log.info('LoRA injected: rank=%s, layers=%s, base frozen', lora_rank, n_lora)
 model = model.to(device)
 optim = get_optim(args, model)
 # print(model)
@@ -209,7 +259,7 @@ def main():
 
     # Initialize dataparallel if enabled and possible.
     if args.dp and torch.cuda.device_count() > 1 and args.cuda:
-        print(f'Training using {torch.cuda.device_count()} GPUs')
+        log.info('Training using %d GPUs', torch.cuda.device_count())
         model_dp = torch.nn.DataParallel(model.cpu())
         model_dp = model_dp.cuda()
     else:
@@ -229,18 +279,24 @@ def main():
         model_ema = model
         model_ema_dp = model_dp
 
+    scaler = torch.cuda.amp.GradScaler() if getattr(args, 'use_amp', False) and args.cuda else None
+    if scaler is not None:
+        log.info('Training with mixed precision (AMP)')
     best_nll_val = 1e8
     best_nll_test = 1e8
-    for epoch in range(args.start_epoch, args.n_epochs):
+    epoch_range = range(args.start_epoch, args.n_epochs)
+    for epoch in tqdm(epoch_range, desc="Epochs", unit="ep", total=args.n_epochs):
         start_epoch = time.time()
         train_test.train_epoch(args, dataloaders['train'], epoch, model, model_dp, model_ema, ema, device, dtype,
                                property_norms, optim, nodes_dist, gradnorm_queue, dataset_info,
-                               prop_dist)
-        print(f"Epoch took {time.time() - start_epoch:.1f} seconds.")
+                               prop_dist, scaler=scaler, total_epochs=args.n_epochs)
+        log.info("Epoch %d took %.1f s.", epoch + 1, time.time() - start_epoch)
 
         if epoch % args.test_epochs == 0:
             if isinstance(model, en_diffusion.EnVariationalDiffusion):
-                wandb.log(model.log_info(), commit=True)
+                model_info = model.log_info()
+                log.info('Model info: %s', model_info)
+                # wandb.log(model_info, commit=True)
 
             if not args.break_train_epoch:
                 train_test.analyze_and_save(epoch, model_ema, nodes_dist, args, device,
@@ -269,11 +325,13 @@ def main():
                     utils.save_model(model_ema, 'outputs/%s/generative_model_ema_%d.npy' % (args.exp_name, epoch))
                 with open('outputs/%s/args_%d.pickle' % (args.exp_name, epoch), 'wb') as f:
                     pickle.dump(args, f)
-            print('Val loss: %.4f \t Test loss:  %.4f' % (nll_val, nll_test))
-            print('Best val loss: %.4f \t Best test loss:  %.4f' % (best_nll_val, best_nll_test))
-            wandb.log({"Val loss ": nll_val}, commit=True)
-            wandb.log({"Test loss ": nll_test}, commit=True)
-            wandb.log({"Best cross-validated test loss ": best_nll_test}, commit=True)
+            log.info('Val loss: %.4f \t Test loss: %.4f', nll_val, nll_test)
+            log.info('Best val loss: %.4f \t Best test loss: %.4f', best_nll_val, best_nll_test)
+            log.info('metrics epoch=%d nll_val=%.4f nll_test=%.4f best_nll_val=%.4f best_nll_test=%.4f',
+                     epoch + 1, nll_val, nll_test, best_nll_val, best_nll_test)
+            # wandb.log({"Val loss ": nll_val}, commit=True)
+            # wandb.log({"Test loss ": nll_test}, commit=True)
+            # wandb.log({"Best cross-validated test loss ": best_nll_test}, commit=True)
 
 
 if __name__ == "__main__":

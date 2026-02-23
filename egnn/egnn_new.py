@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 import math
+from torch.utils.checkpoint import checkpoint
 
 class GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, normalization_factor, aggregation_method,
@@ -147,10 +148,14 @@ class EquivariantBlock(nn.Module):
         return h, x
 
 
+def _run_block(block, h, x, edge_index, node_mask, edge_mask, edge_attr):
+    return block(h, x, edge_index, node_mask=node_mask, edge_mask=edge_mask, edge_attr=edge_attr)
+
+
 class EGNN(nn.Module):
     def __init__(self, in_node_nf, in_edge_nf, hidden_nf, device='cpu', act_fn=nn.SiLU(), n_layers=3, attention=False,
                  norm_diff=True, out_node_nf=None, tanh=False, coords_range=15, norm_constant=1, inv_sublayers=2,
-                 sin_embedding=False, normalization_factor=100, aggregation_method='sum'):
+                 sin_embedding=False, normalization_factor=100, aggregation_method='sum', use_checkpointing=False):
         super(EGNN, self).__init__()
         if out_node_nf is None:
             out_node_nf = in_node_nf
@@ -161,6 +166,7 @@ class EGNN(nn.Module):
         self.norm_diff = norm_diff
         self.normalization_factor = normalization_factor
         self.aggregation_method = aggregation_method
+        self.use_checkpointing = use_checkpointing
 
         if sin_embedding:
             self.sin_embedding = SinusoidsEmbeddingNew()
@@ -188,7 +194,11 @@ class EGNN(nn.Module):
             distances = self.sin_embedding(distances)
         h = self.embedding(h)
         for i in range(0, self.n_layers):
-            h, x = self._modules["e_block_%d" % i](h, x, edge_index, node_mask=node_mask, edge_mask=edge_mask, edge_attr=distances)
+            block = self._modules["e_block_%d" % i]
+            if self.use_checkpointing and self.training:
+                h, x = checkpoint(_run_block, block, h, x, edge_index, node_mask, edge_mask, distances, use_reentrant=False)
+            else:
+                h, x = block(h, x, edge_index, node_mask=node_mask, edge_mask=edge_mask, edge_attr=distances)
 
         # Important, the bias of the last linear might be non-zero
         h = self.embedding_out(h)
