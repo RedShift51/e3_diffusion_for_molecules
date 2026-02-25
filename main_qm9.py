@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 import argparse
 # import wandb  # disabled: use --no_wandb or log file only
 from configs.datasets_config import get_dataset_info
+import os
 from os.path import join
 from qm9 import dataset
 from qm9.models import get_optim, get_model
@@ -305,10 +306,12 @@ def check_mask_correct(variables, node_mask):
 
 def main():
     if args.resume is not None:
-        flow_state_dict = torch.load(join(args.resume, 'flow.npy'))
-        optim_state_dict = torch.load(join(args.resume, 'optim.npy'))
+        model_path = join(args.resume, 'generative_model.npy')
+        flow_state_dict = torch.load(model_path, map_location=device)
+        optim_state_dict = torch.load(join(args.resume, 'optim.npy'), map_location=device)
         model.load_state_dict(flow_state_dict)
         optim.load_state_dict(optim_state_dict)
+        log.info('Resumed model and optim from %s', args.resume)
 
     # Initialize dataparallel if enabled and possible.
     if args.dp and torch.cuda.device_count() > 1:
@@ -321,6 +324,11 @@ def main():
     # Initialize model copy for exponential moving average of params.
     if args.ema_decay > 0:
         model_ema = copy.deepcopy(model)
+        if args.resume is not None:
+            ema_path = join(args.resume, 'generative_model_ema.npy')
+            if os.path.isfile(ema_path):
+                model_ema.load_state_dict(torch.load(ema_path, map_location=device))
+                log.info('Resumed EMA weights from %s', ema_path)
         ema = flow_utils.EMA(args.ema_decay)
 
         if args.dp and torch.cuda.device_count() > 1:

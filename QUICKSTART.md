@@ -48,6 +48,21 @@ python main_geom_drugs.py --n_epochs 3000 --exp_name edm_geom_lora --nf 256 --n_
 
 ---
 
+## Продолжение обучения (resume)
+
+Если обучение прервалось, подставь путь к папке эксперимента и эпоху, с которой продолжать (следующую после последней сохранённой):
+
+```bash
+python main_qm9.py --config configs/edm_qm9.yaml --resume outputs/edm_qm9_2026-02-23_06-10-52 --start_epoch 521
+```
+
+- `--resume` — каталог с чекпоинтами (`args.pickle`, `generative_model.npy`, `generative_model_ema.npy`, `optim.npy`).
+- `--start_epoch` — номер эпохи, с которой стартовать (например, если последний сохранённый чекпоинт — epoch 520, укажи `521`). Конфиг и остальные гиперпараметры берутся из `args.pickle` в папке resume.
+
+Новый лог и чекпоинты пойдут в `outputs/<exp_name>_resume/`.
+
+---
+
 ## Скачивание датасетов
 
 - **QM9** — скачивается сам: при первом запуске, если в каталоге `--datadir` (по умолчанию `qm9/temp`) нет готовых сплитов `train.npz` / `valid.npz` / `test.npz`, данные автоматически загружаются с Figshare и обрабатываются.
